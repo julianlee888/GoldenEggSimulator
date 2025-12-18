@@ -10,7 +10,7 @@ from matplotlib import font_manager as fm
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="退休提領回測工具",
+    page_title="金蛋模擬器",
     page_icon="💰",
     layout="wide"
 )
@@ -287,7 +287,7 @@ with st.sidebar.expander("2. 通膨設定", expanded=False):
         st.caption("將使用 FRED (CPIAUCSL) 歷史數據")
 
 with st.sidebar.expander("3. 投資標的代碼", expanded=False):
-    st.caption("輸入 'CASH0' 可模擬零息現金")
+    st.caption("輸入YAHOO Finance代碼，'CASH0'模擬零息現金")
     sym_stock = st.text_input("股票代碼", "VFINX")
     sym_bond = st.text_input("債券代碼", "VUSTX")
     sym_cash = st.text_input("現金代碼", "VFISX")
@@ -310,8 +310,8 @@ p2 = portfolio_input(2, 50, 50, 0)
 p3 = portfolio_input(3, 50, 0, 50)
 
 # 主畫面
-st.title("📈 退休提領回測工具 (Web版)")
-st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
+st.title("📈金蛋模擬器")
+st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金提領模擬器")
 
 # --- 5. 執行模擬 ---
 
