@@ -4,3 +4,5 @@ pandas
 numpy
 matplotlib
 lxml
+requests
+firebase-admin
