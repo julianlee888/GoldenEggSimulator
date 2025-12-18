@@ -4,7 +4,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import pandas_datareader.data as web
 import datetime
 import os
 from matplotlib import font_manager as fm
@@ -53,8 +52,10 @@ class RetirementSimulator:
         self.stock_symbol = stock_symbol
         self.bond_symbol = bond_symbol
         self.cash_symbol = cash_symbol
-        self.start_date = start_date
-        self.end_date = end_date
+        self.start_date = pd.to_datetime(start_date)
+        # 如果 end_date 是 None 或今天，處理一下
+        self.end_date = pd.to_datetime(end_date) if end_date else pd.Timestamp.now()
+        
         self.returns = pd.DataFrame()
         self.cpi_annual = None
         self.is_data_valid = False
@@ -111,15 +112,27 @@ class RetirementSimulator:
         self.is_data_valid = True
 
     def download_cpi(self):
+        """
+        改用 Pandas 直接讀取 FRED CSV，取代 pandas_datareader 以解決 Python 3.12+ 相容性問題
+        """
         try:
-            start = pd.to_datetime(self.start_date)
-            end = pd.to_datetime(self.end_date) if self.end_date else datetime.datetime.now()
-            cpi_data = web.DataReader('CPIAUCSL', 'fred', start, end)
+            # 直接從 FRED 網站讀取 CPIAUCSL 的 CSV 檔案
+            url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+            cpi_data = pd.read_csv(url, index_col='DATE', parse_dates=True)
+            
+            # 篩選日期範圍 (稍微放寬一點範圍以確保能計算前後的通膨)
+            cpi_data = cpi_data.loc[self.start_date - pd.Timedelta(days=365) : self.end_date + pd.Timedelta(days=365)]
+            
+            # 計算年度通膨率
             self.cpi_annual = cpi_data.resample('YE').last().pct_change()
             self.cpi_annual.columns = ['inflation_rate']
+            
+            # 填補可能的空值
             mean_inflation = self.cpi_annual['inflation_rate'].mean()
             self.cpi_annual['inflation_rate'] = self.cpi_annual['inflation_rate'].fillna(mean_inflation)
-        except:
+            
+        except Exception as e:
+            # st.warning(f"CPI 下載失敗: {e}，將使用預設通膨") # 除錯用
             self.cpi_annual = None
 
     def get_annual_returns_df(self):
@@ -144,21 +157,15 @@ class RetirementSimulator:
         start_year = annual_returns.index[0].year
         current_balance = initial_portfolio
         current_withdrawal = initial_portfolio * withdrawal_rate
-        history = [current_balance] # 包含期初
         
-        # 新增：詳細收支記錄
+        # 記錄
         records = []
         cumulative_withdrawal = 0.0
 
         failed = False
         failure_year = None
 
-        # 為了讓 history 長度對應正確，我們記錄「該年度結束時」的餘額
-        # 第一筆 history 是初始本金，不算在 loop 裡
-        # run_simulation 的 history 列表邏輯：index 0 是初始，index 1 是第 1 年結束...
-        
-        # 重置 history，我們只存期末餘額以便畫圖 (或者保留期初)
-        # 這裡為了畫圖方便，保留原邏輯：history[0] = 期初, history[i] = 第 i 年期末
+        # history[0] = 期初
         history = [initial_portfolio]
 
         for date, row in annual_returns.iterrows():
@@ -175,8 +182,6 @@ class RetirementSimulator:
                 failed = True
                 failure_year = year - start_year + 1
                 
-                # 破產該年，實際能領的只有剩下的錢 (雖然邏輯上是失敗，但記錄上就記原本想領的或實際領的)
-                # 這裡記錄「計畫提領」比較能看出原本想領多少
                 cumulative_withdrawal += this_year_withdrawal
                 
                 records.append({
@@ -206,37 +211,35 @@ class RetirementSimulator:
                 '累計提領': cumulative_withdrawal
             })
 
-            # 3. 通膨調整 (為下一年準備)
+            # 3. 通膨調整
             if use_fixed_inflation:
                 inflation = fixed_inflation_rate
             else:
-                inflation = 0.03
+                inflation = 0.03 # 預設 fallback
                 if self.cpi_annual is not None:
                     try:
-                        val = self.cpi_annual.loc[self.cpi_annual.index.year == year, 'inflation_rate'].values[0]
-                        inflation = val
+                        # 嘗試抓取該年的通膨率
+                        # 因為 cpi_annual 是 YE (年底)，我們用當年度的數字
+                        if year in self.cpi_annual.index.year:
+                            val = self.cpi_annual.loc[self.cpi_annual.index.year == year, 'inflation_rate'].values[0]
+                            inflation = val
                     except: pass
             current_withdrawal *= (1 + inflation)
 
-        # 補齊剩餘年份的 0 (若提早破產)
-        # 需要補齊 history 和 records
+        # 補齊剩餘年份
         last_recorded_year = records[-1]['年份'] if records else start_year - 1
         
         while len(history) < years_retired + 1:
             history.append(0)
             last_recorded_year += 1
-            # 破產後提領為 0
             records.append({
                 '年份': last_recorded_year,
                 '期末餘額': 0,
                 '當年度提領': 0,
-                '累計提領': cumulative_withdrawal # 累計不再增加
+                '累計提領': cumulative_withdrawal 
             })
 
-        # 建立詳細 DataFrame
         detailed_df = pd.DataFrame(records)
-        # 設定年份為索引，雖然介面上可能直接顯示 Column 比較好看，這裡保留年份為欄位
-        # detailed_df.set_index('年份', inplace=True)
 
         # 計算指標
         history_np = np.array(history)
@@ -245,11 +248,9 @@ class RetirementSimulator:
         drawdowns = (running_max - history_np) / running_max
         mdd = drawdowns.max()
         mdd_idx = drawdowns.argmax()
-        mdd_year = start_year + mdd_idx - 1 # history index 0 is start, index 1 is year 1 end
-        if mdd_year < start_year: mdd_year = start_year # fallback
+        mdd_year = start_year + mdd_idx - 1 
+        if mdd_year < start_year: mdd_year = start_year 
         
-        # cagr 計算 (使用最後一年非 0 餘額比較合理，或者直接用終值)
-        # 若破產，終值為 0，cagr 為 -1
         final_balance_val = history[-1]
         cagr = (final_balance_val / initial_portfolio) ** (1/years_retired) - 1 if final_balance_val > 0 else -1.0
 
@@ -324,7 +325,8 @@ def load_market_data(s, b, c, start, end):
 
 if st.button("開始回測", type="primary"):
     with st.spinner("正在下載歷史數據並計算中..."):
-        sim = load_market_data(sym_stock, sym_bond, sym_cash, start_d, end_d)
+        # 轉換 date 為 datetime 確保 pandas 相容
+        sim = load_market_data(sym_stock, sym_bond, sym_cash, str(start_d), str(end_d))
         
         if not sim.is_data_valid:
             st.error(sim.error_msg)
@@ -333,7 +335,7 @@ if st.button("開始回測", type="primary"):
             annual_df = sim.get_annual_returns_df()
             total_years = len(annual_df)
             
-            st.success(f"數據下載成功！期間: {sim.start_date} 至 {sim.end_date} (共 {total_years} 年)")
+            st.success(f"數據下載成功！期間: {sim.start_date.strftime('%Y-%m-%d')} 至 {sim.end_date.strftime('%Y-%m-%d')} (共 {total_years} 年)")
             
             # Tab 分頁
             tab1, tab2, tab3, tab4 = st.tabs(["📊 資產走勢圖", "📋 詳細統計數據", "📅 市場年度報酬", "📄 詳細收支表"])
