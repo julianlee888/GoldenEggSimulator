@@ -9,16 +9,19 @@ import os
 import io
 import requests
 import json
+import base64
+import time
 from matplotlib import font_manager as fm
+from streamlit_oauth import OAuth2Component
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="金蛋模擬器",
+    page_title="退休提領回測工具",
     page_icon="💰",
     layout="wide"
 )
 
-# --- 2. 字型設定 ---
+# --- 2. 工具函式：字型 ---
 @st.cache_resource
 def install_chinese_font():
     font_path = 'NotoSansCJKtc-Regular.otf'
@@ -42,59 +45,34 @@ def install_chinese_font():
 install_chinese_font()
 plt.style.use('ggplot')
 
-# --- 3. Firebase REST API 邏輯 (無須 Admin SDK) ---
-
-def get_firebase_config():
-    """從 Secrets 讀取設定，若無則回傳空字串"""
+# --- 3. 工具函式：Firebase 寫入 ---
+def save_lead_to_firebase(email):
+    """將使用者的 Email 寫入 Firestore"""
     try:
         api_key = st.secrets["FIREBASE_WEB_API_KEY"]
         project_id = st.secrets["FIREBASE_PROJECT_ID"]
-        return api_key, project_id
-    except:
-        return "", ""
-
-def firebase_login(email, password, api_key):
-    """使用者登入，回傳 idToken"""
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
-    payload = {"email": email, "password": password, "returnSecureToken": True}
-    response = requests.post(url, json=payload)
-    return response.json()
-
-def firebase_signup(email, password, api_key):
-    """使用者註冊，回傳 idToken"""
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={api_key}"
-    payload = {"email": email, "password": password, "returnSecureToken": True}
-    response = requests.post(url, json=payload)
-    return response.json()
-
-def save_lead_rest(project_id, id_token, uid, email):
-    """
-    使用 Firestore REST API 寫入資料
-    不需要 Service Account，改用使用者的 idToken 驗證
-    """
-    # Firestore REST API URL
-    url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/marketing_leads/{uid}"
-    
-    # Firestore 的 JSON 格式比較特殊，需要包裝成 fields > type
-    payload = {
-        "fields": {
-            "email": {"stringValue": email},
-            "source": {"stringValue": "retirement_app"},
-            "created_at": {"timestampValue": datetime.datetime.utcnow().isoformat() + "Z"}
+        
+        # 使用 REST API 寫入 (不需要複雜驗證，因為我們已經在 Rules 開放寫入)
+        # 使用 email 作為文件 ID，避免重複寫入
+        doc_id = base64.b64encode(email.encode()).decode() # 簡單編碼當ID
+        
+        url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/marketing_leads/{doc_id}?key={api_key}"
+        
+        payload = {
+            "fields": {
+                "email": {"stringValue": email},
+                "source": {"stringValue": "google_oauth_login"},
+                "last_login": {"timestampValue": datetime.datetime.utcnow().isoformat() + "Z"}
+            }
         }
-    }
-    
-    # 需要在 Header 帶入登入後的 Token
-    headers = {
-        "Authorization": f"Bearer {id_token}",
-        "Content-Type": "application/json"
-    }
-    
-    # 使用 PATCH 方法 (若文件存在則更新，不存在則建立)
-    response = requests.patch(url, json=payload, headers=headers)
-    return response.status_code == 200
+        
+        # 使用 PATCH (如果存在就更新時間，不存在就建立)
+        requests.patch(url, json=payload)
+    except Exception as e:
+        # 寫入失敗不影響使用者使用，默默紀錄就好
+        print(f"Firebase write error: {e}")
 
-# --- 4. 核心模擬邏輯 (RetirementSimulator) ---
+# --- 4. 核心邏輯類別 (模擬器) ---
 class RetirementSimulator:
     def __init__(self, stock_symbol, bond_symbol, cash_symbol, start_date, end_date):
         self.stock_symbol = stock_symbol
@@ -261,7 +239,6 @@ class RetirementSimulator:
             'years': years_retired
         }
 
-# --- Excel 下載函式 ---
 def to_excel(results_dict, annual_returns_df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -283,200 +260,199 @@ def to_excel(results_dict, annual_returns_df):
             res['detailed_df'].to_excel(writer, sheet_name=sheet_name, startrow=8, index=False)
     return output.getvalue()
 
-# --- 5. Streamlit 介面邏輯 ---
+# --- 5. 主程式介面邏輯 (登入牆) ---
 
-WEB_API_KEY, PROJECT_ID = get_firebase_config()
-
-# 側邊欄：登入與行銷收集區
-st.sidebar.header("👤 會員專區")
 if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
-if "user_token" not in st.session_state:
-    st.session_state["user_token"] = None
 
-if st.session_state["user_email"]:
-    st.sidebar.success(f"歡迎, {st.session_state['user_email']}")
-    if st.sidebar.button("登出"):
-        st.session_state["user_email"] = None
-        st.session_state["user_token"] = None
-        st.rerun()
-else:
-    if not WEB_API_KEY or not PROJECT_ID:
-        st.sidebar.error("⚠️ 未設定 Secrets (API Key 或 Project ID)")
-    else:
-        tab_login, tab_signup = st.sidebar.tabs(["登入", "註冊"])
-
-        with tab_login:
-            l_email = st.text_input("Email", key="l_email")
-            l_pass = st.text_input("密碼", type="password", key="l_pass")
-            if st.button("登入", key="btn_login"):
-                res = firebase_login(l_email, l_pass, WEB_API_KEY)
-                if "error" in res:
-                    st.error("登入失敗: " + res["error"]["message"])
-                else:
-                    st.session_state["user_email"] = res["email"]
-                    st.session_state["user_token"] = res["idToken"]
-                    st.success("登入成功！")
-                    st.rerun()
-
-        with tab_signup:
-            st.markdown("註冊免費會員，解鎖完整報告下載！")
-            s_email = st.text_input("Email", key="s_email")
-            s_pass = st.text_input("密碼", type="password", key="s_pass")
-            if st.button("註冊", key="btn_signup"):
-                res = firebase_signup(s_email, s_pass, WEB_API_KEY)
-                if "error" in res:
-                    st.error("註冊失敗: " + res["error"]["message"])
-                else:
-                    st.session_state["user_email"] = res["email"]
-                    st.session_state["user_token"] = res["idToken"]
-                    # 註冊成功後，使用 REST API 寫入資料庫
-                    save_lead_rest(PROJECT_ID, res["idToken"], res["localId"], res["email"])
-                    st.success("註冊成功！")
-                    st.rerun()
-
-st.sidebar.divider()
-
-# 側邊欄：參數設定
-st.sidebar.header("⚙️ 參數設定")
-with st.sidebar.expander("1. 資金與期間", expanded=True):
-    start_capital = st.number_input("初始本金", value=10000000, step=100000)
-    withdrawal_rate = st.slider("初始提領率 (%)", 1.0, 10.0, 4.0, 0.1) / 100.0
-    col_d1, col_d2 = st.columns(2)
-    start_d = col_d1.date_input("開始日期", datetime.date(1986, 1, 1))
-    end_d = col_d2.date_input("結束日期", datetime.date.today())
-
-with st.sidebar.expander("2. 通膨設定", expanded=False):
-    use_fixed_infl = st.toggle("使用固定通膨率", value=True)
-    fixed_infl_rate = st.slider("固定通膨率 (%)", 0.0, 10.0, 3.0, 0.5) / 100.0
-    if not use_fixed_infl:
-        st.caption("將使用 FRED (CPIAUCSL) 歷史數據")
-
-with st.sidebar.expander("3. 投資標的代碼", expanded=False):
-    st.caption("輸入YAHOO Finance代碼，'CASH0'模擬零息現金")
-    sym_stock = st.text_input("股票代碼", "VFINX")
-    sym_bond = st.text_input("債券代碼", "VUSTX")
-    sym_cash = st.text_input("現金代碼", "VFISX")
-
-st.sidebar.subheader("投資組合比例設定")
-def portfolio_input(idx, def_s, def_b, def_c):
-    st.sidebar.markdown(f"**組合 {idx}**")
-    c1, c2, c3 = st.sidebar.columns(3)
-    s = c1.number_input(f"股%", value=def_s, key=f"s{idx}", step=5)
-    b = c2.number_input(f"債%", value=def_b, key=f"b{idx}", step=5)
-    c = c3.number_input(f"現%", value=def_c, key=f"c{idx}", step=5)
-    total = s + b + c
-    if total != 100:
-        st.sidebar.warning(f"總和: {total}% (將自動正規化)")
-    return s/100, b/100, c/100
-
-p1 = portfolio_input(1, 100, 0, 0)
-p2 = portfolio_input(2, 50, 50, 0)
-p3 = portfolio_input(3, 50, 0, 50)
-
-st.title("📈金蛋模擬器")
-st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金提領模擬器")
-
-# --- 6. 執行模擬 ---
-
-@st.cache_data(ttl=3600)
-def load_market_data(s, b, c, start, end):
-    sim = RetirementSimulator(s, b, c, start, end)
-    sim.download_data()
-    sim.download_cpi()
-    return sim
-
-if st.button("開始回測", type="primary"):
-    with st.spinner("正在下載歷史數據並計算中..."):
-        sim = load_market_data(sym_stock, sym_bond, sym_cash, str(start_d), str(end_d))
+# --- 畫面 A: 尚未登入 ---
+if not st.session_state["user_email"]:
+    st.title("🔒 退休提領回測工具")
+    st.markdown("### 請登入以使用完整功能")
+    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
+    
+    try:
+        # 設定 OAuth 元件
+        oauth2 = OAuth2Component(
+            st.secrets["GOOGLE_CLIENT_ID"], 
+            st.secrets["GOOGLE_CLIENT_SECRET"],
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "openid email profile"
+        )
         
-        if not sim.is_data_valid:
-            st.error(sim.error_msg)
-        else:
-            annual_df = sim.get_annual_returns_df()
-            total_years = len(annual_df)
-            actual_start_str = sim.actual_start_date.strftime('%Y-%m-%d')
-            actual_end_str = sim.actual_end_date.strftime('%Y-%m-%d')
+        # 顯示登入按鈕
+        result = oauth2.authorize_button(
+            name="使用 Google 帳號登入",
+            icon="https://www.google.com.tw/favicon.ico",
+            redirect_uri=st.secrets["GOOGLE_REDIRECT_URI"],
+            key="google_auth_btn"
+        )
+        
+        if result:
+            # 解析 Email
+            id_token = result["token"]["id_token"]
+            payload = id_token.split('.')[1]
+            payload += '=' * (-len(payload) % 4)
+            decoded = json.loads(base64.b64decode(payload).decode('utf-8'))
+            email = decoded.get("email")
             
-            st.success(f"數據下載成功！實際數據期間: {actual_start_str} 至 {actual_end_str} (共 {total_years} 年)")
-            if sim.request_start_date < sim.actual_start_date:
-                st.info(f"💡 提示：您請求的開始日期 ({start_d}) 早於數據上市日期，已自動調整為實際最早可用日期。")
+            if email:
+                st.session_state["user_email"] = email
+                # 寫入資料庫
+                save_lead_to_firebase(email)
+                st.success(f"登入成功！歡迎 {email}")
+                time.sleep(1)
+                st.rerun()
+                
+    except Exception as e:
+        st.error(f"登入設定錯誤: {e}")
+        st.info("請檢查 Secrets 設定是否正確")
 
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 資產走勢圖", "📋 詳細統計數據", "📅 市場年度報酬", "📄 詳細收支表"])
+# --- 畫面 B: 已登入 (顯示計算機) ---
+else:
+    # 側邊欄：使用者資訊
+    with st.sidebar:
+        st.write(f"👤 **{st.session_state['user_email']}**")
+        if st.button("登出"):
+            st.session_state["user_email"] = None
+            st.rerun()
+        st.divider()
+
+    # 側邊欄：參數設定
+    st.sidebar.header("⚙️ 參數設定")
+    with st.sidebar.expander("1. 資金與期間", expanded=True):
+        start_capital = st.number_input("初始本金", value=10000000, step=100000)
+        withdrawal_rate = st.slider("初始提領率 (%)", 1.0, 10.0, 4.0, 0.1) / 100.0
+        col_d1, col_d2 = st.columns(2)
+        start_d = col_d1.date_input("開始日期", datetime.date(1986, 1, 1))
+        end_d = col_d2.date_input("結束日期", datetime.date.today())
+
+    with st.sidebar.expander("2. 通膨設定", expanded=False):
+        use_fixed_infl = st.toggle("使用固定通膨率", value=True)
+        fixed_infl_rate = st.slider("固定通膨率 (%)", 0.0, 10.0, 3.0, 0.5) / 100.0
+        if not use_fixed_infl:
+            st.caption("將使用 FRED (CPIAUCSL) 歷史數據")
+
+    with st.sidebar.expander("3. 投資標的代碼", expanded=False):
+        st.caption("輸入 'CASH0' 可模擬零息現金")
+        sym_stock = st.text_input("股票代碼", "VFINX")
+        sym_bond = st.text_input("債券代碼", "VUSTX")
+        sym_cash = st.text_input("現金代碼", "VFISX")
+
+    st.sidebar.subheader("投資組合比例設定")
+    def portfolio_input(idx, def_s, def_b, def_c):
+        st.sidebar.markdown(f"**組合 {idx}**")
+        c1, c2, c3 = st.sidebar.columns(3)
+        s = c1.number_input(f"股%", value=def_s, key=f"s{idx}", step=5)
+        b = c2.number_input(f"債%", value=def_b, key=f"b{idx}", step=5)
+        c = c3.number_input(f"現%", value=def_c, key=f"c{idx}", step=5)
+        total = s + b + c
+        if total != 100:
+            st.sidebar.warning(f"總和: {total}% (將自動正規化)")
+        return s/100, b/100, c/100
+
+    p1 = portfolio_input(1, 100, 0, 0)
+    p2 = portfolio_input(2, 50, 50, 0)
+    p3 = portfolio_input(3, 50, 0, 50)
+
+    st.title("📈 退休提領回測工具 (Web版)")
+    st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
+
+    # 載入數據函式 (放在這裡確保只在登入後執行)
+    @st.cache_data(ttl=3600)
+    def load_market_data(s, b, c, start, end):
+        sim = RetirementSimulator(s, b, c, start, end)
+        sim.download_data()
+        sim.download_cpi()
+        return sim
+
+    if st.button("開始回測", type="primary"):
+        with st.spinner("正在下載歷史數據並計算中..."):
+            sim = load_market_data(sym_stock, sym_bond, sym_cash, str(start_d), str(end_d))
             
-            results = {}
-            configs = [("組合 1", p1), ("組合 2", p2), ("組合 3", p3)]
-            
-            for name, (s, b, c) in configs:
-                parts = []
-                if s>0: parts.append(f"股{s:.0%}")
-                if b>0: parts.append(f"債{b:.0%}")
-                if c>0: parts.append(f"現{c:.0%}")
-                full_name = " + ".join(parts)
-                res = sim.run_simulation(start_capital, withdrawal_rate, s, b, c, use_fixed_infl, fixed_infl_rate)
-                if res:
-                    results[full_name] = res
+            if not sim.is_data_valid:
+                st.error(sim.error_msg)
+            else:
+                annual_df = sim.get_annual_returns_df()
+                total_years = len(annual_df)
+                actual_start_str = sim.actual_start_date.strftime('%Y-%m-%d')
+                actual_end_str = sim.actual_end_date.strftime('%Y-%m-%d')
+                
+                st.success(f"數據下載成功！實際數據期間: {actual_start_str} 至 {actual_end_str} (共 {total_years} 年)")
+                if sim.request_start_date < sim.actual_start_date:
+                    st.info(f"💡 提示：您請求的開始日期 ({start_d}) 早於數據上市日期，已自動調整為實際最早可用日期。")
 
-            with tab1:
-                if results:
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    colors = ['#3498db', '#2ecc71', '#e74c3c']
-                    for i, (name, res) in enumerate(results.items()):
-                        history = np.array(res['history'])
-                        years = range(len(history))
-                        color = colors[i % len(colors)]
-                        ax.plot(years, history/1000000, label=name, linewidth=2.5, color=color)
-                        ax.scatter(years[-1], history[-1]/1000000, s=50, color=color)
-                    ax.set_title(f"資產淨值走勢 ({total_years}年期間)", fontsize=14)
-                    ax.set_xlabel("經過年數")
-                    ax.set_ylabel("資產餘額 (百萬)")
-                    ax.legend()
-                    ax.grid(True, linestyle='--', alpha=0.7)
-                    st.pyplot(fig)
-                else:
-                    st.warning("無有效模擬結果")
+                tab1, tab2, tab3, tab4 = st.tabs(["📊 資產走勢圖", "📋 詳細統計數據", "📅 市場年度報酬", "📄 詳細收支表"])
+                
+                results = {}
+                configs = [("組合 1", p1), ("組合 2", p2), ("組合 3", p3)]
+                
+                for name, (s, b, c) in configs:
+                    parts = []
+                    if s>0: parts.append(f"股{s:.0%}")
+                    if b>0: parts.append(f"債{b:.0%}")
+                    if c>0: parts.append(f"現{c:.0%}")
+                    full_name = " + ".join(parts)
+                    res = sim.run_simulation(start_capital, withdrawal_rate, s, b, c, use_fixed_infl, fixed_infl_rate)
+                    if res:
+                        results[full_name] = res
 
-            with tab2:
-                for name, res in results.items():
-                    with st.container():
-                        st.subheader(name)
-                        c1, c2, c3, c4 = st.columns(4)
-                        is_success = res['success']
-                        final_bal = res['final_balance']
-                        cagr = res['cagr']
-                        mdd = res['mdd']
-                        c1.metric("模擬結果", "成功" if is_success else f"第 {res['failure_year']} 年破產", delta_color="normal" if is_success else "inverse")
-                        c2.metric("期末資產", f"${final_bal:,.0f}")
-                        c3.metric("CAGR (年化)", f"{cagr:.2%}")
-                        c4.metric("最大回撤 (MDD)", f"{mdd:.1%}", help=f"發生於第 {res['mdd_year']} 年")
-                        st.divider()
+                with tab1:
+                    if results:
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        colors = ['#3498db', '#2ecc71', '#e74c3c']
+                        for i, (name, res) in enumerate(results.items()):
+                            history = np.array(res['history'])
+                            years = range(len(history))
+                            color = colors[i % len(colors)]
+                            ax.plot(years, history/1000000, label=name, linewidth=2.5, color=color)
+                            ax.scatter(years[-1], history[-1]/1000000, s=50, color=color)
+                        ax.set_title(f"資產淨值走勢 ({total_years}年期間)", fontsize=14)
+                        ax.set_xlabel("經過年數")
+                        ax.set_ylabel("資產餘額 (百萬)")
+                        ax.legend()
+                        ax.grid(True, linestyle='--', alpha=0.7)
+                        st.pyplot(fig)
+                    else:
+                        st.warning("無有效模擬結果")
 
-            with tab3:
-                st.markdown("### 各資產年度報酬率")
-                fmt_df = annual_df.style.format("{:.2%}")
-                def color_negative_red(val):
-                    color = 'red' if val < 0 else 'green'
-                    return f'color: {color}'
-                fmt_df = fmt_df.map(color_negative_red)
-                st.dataframe(fmt_df, use_container_width=True)
+                with tab2:
+                    for name, res in results.items():
+                        with st.container():
+                            st.subheader(name)
+                            c1, c2, c3, c4 = st.columns(4)
+                            is_success = res['success']
+                            final_bal = res['final_balance']
+                            cagr = res['cagr']
+                            mdd = res['mdd']
+                            c1.metric("模擬結果", "成功" if is_success else f"第 {res['failure_year']} 年破產", delta_color="normal" if is_success else "inverse")
+                            c2.metric("期末資產", f"${final_bal:,.0f}")
+                            c3.metric("CAGR (年化)", f"{cagr:.2%}")
+                            c4.metric("最大回撤 (MDD)", f"{mdd:.1%}", help=f"發生於第 {res['mdd_year']} 年")
+                            st.divider()
 
-            with tab4:
-                # 這裡加入會員權限控管
-                if st.session_state["user_email"]:
+                with tab3:
+                    st.markdown("### 各資產年度報酬率")
+                    fmt_df = annual_df.style.format("{:.2%}")
+                    def color_negative_red(val):
+                        color = 'red' if val < 0 else 'green'
+                        return f'color: {color}'
+                    fmt_df = fmt_df.map(color_negative_red)
+                    st.dataframe(fmt_df, use_container_width=True)
+
+                with tab4:
                     st.markdown("### 年度詳細收支表")
                     for name, res in results.items():
                         with st.expander(f"{name} - 詳細數據", expanded=False):
                             df_detail = res['detailed_df']
                             df_show = df_detail.set_index('年份')
                             st.dataframe(df_show.style.format({'期末餘額': '${:,.0f}', '當年度提領': '${:,.0f}', '累計提領': '${:,.0f}'}), use_container_width=True)
-                else:
-                    st.warning("🔒 此功能僅限會員使用，請在左側註冊或登入。")
-                    st.info("註冊後即可解鎖「詳細收支表」與「Excel 報告下載」功能！")
 
-            # --- 下載按鈕 (權限控管) ---
-            st.divider()
-            if results:
-                if st.session_state["user_email"]:
+                # 下載按鈕 (現在人人可見，因為已經登入才能進來)
+                st.divider()
+                if results:
                     excel_data = to_excel(results, annual_df)
                     st.download_button(
                         label="📥 下載完整 Excel 報告",
@@ -484,8 +460,5 @@ if st.button("開始回測", type="primary"):
                         file_name='retirement_simulation_report.xlsx',
                         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                     )
-                else:
-                    st.button("🔒 登入後下載完整 Excel 報告", disabled=True)
-
-else:
-    st.info("👈 請在左側調整參數，並點擊「開始回測」按鈕")
+    else:
+        st.info("👈 請在左側調整參數，並點擊「開始回測」按鈕")
