@@ -16,7 +16,7 @@ from streamlit_oauth import OAuth2Component
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="金蛋模擬器",
+    page_title="退休提領回測工具",
     page_icon="💰",
     layout="wide"
 )
@@ -51,13 +51,8 @@ def save_lead_to_firebase(email):
     try:
         api_key = st.secrets["FIREBASE_WEB_API_KEY"]
         project_id = st.secrets["FIREBASE_PROJECT_ID"]
-        
-        # 使用 REST API 寫入 (不需要複雜驗證，因為我們已經在 Rules 開放寫入)
-        # 使用 email 作為文件 ID，避免重複寫入
-        doc_id = base64.b64encode(email.encode()).decode() # 簡單編碼當ID
-        
+        doc_id = base64.b64encode(email.encode()).decode()
         url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/marketing_leads/{doc_id}?key={api_key}"
-        
         payload = {
             "fields": {
                 "email": {"stringValue": email},
@@ -65,11 +60,8 @@ def save_lead_to_firebase(email):
                 "last_login": {"timestampValue": datetime.datetime.utcnow().isoformat() + "Z"}
             }
         }
-        
-        # 使用 PATCH (如果存在就更新時間，不存在就建立)
         requests.patch(url, json=payload)
     except Exception as e:
-        # 寫入失敗不影響使用者使用，默默紀錄就好
         print(f"Firebase write error: {e}")
 
 # --- 4. 核心邏輯類別 (模擬器) ---
@@ -159,73 +151,97 @@ class RetirementSimulator:
             bond_pct /= total
             cash_pct /= total
 
-        annual_returns = self.returns.resample('YE').apply(lambda x: (1 + x).prod() - 1)
-        years_retired = len(annual_returns)
-        if years_retired < 1: return {}
+        # 改用月度數據進行模擬，以提升 MDD 精確度
+        monthly_returns = self.returns
+        if monthly_returns.empty: return {}
 
-        start_year = annual_returns.index[0].year
+        start_date = monthly_returns.index[0]
         current_balance = initial_portfolio
-        current_withdrawal = initial_portfolio * withdrawal_rate
+        current_annual_withdrawal = initial_portfolio * withdrawal_rate
         
-        records = []
         cumulative_withdrawal = 0.0
         failed = False
         failure_year = None
-        history = [initial_portfolio]
+        history = [initial_portfolio] # 月度資產紀錄
+        
+        # 用於生成年度報表
+        yearly_records = {} 
+        
+        # 設定提領月份 (周年制)
+        withdrawal_month = start_date.month
 
-        for date, row in annual_returns.iterrows():
+        for date, row in monthly_returns.iterrows():
             year = date.year
-            this_year_withdrawal = current_withdrawal
-            current_balance -= current_withdrawal
+            month = date.month
             
+            # --- 1. 處理提領 (每年一次) ---
+            actual_withdrawal_this_month = 0
+            
+            if month == withdrawal_month:
+                # 通膨調整 (第一年除外)
+                if date != start_date:
+                    if use_fixed_inflation:
+                        inflation = fixed_inflation_rate
+                    else:
+                        inflation = 0.03
+                        if self.cpi_annual is not None:
+                            try:
+                                # 抓取前一年的通膨數據
+                                target_year = year - 1
+                                if target_year in self.cpi_annual.index.year:
+                                    inflation = self.cpi_annual.loc[self.cpi_annual.index.year == target_year, 'inflation_rate'].values[0]
+                            except: pass
+                    current_annual_withdrawal *= (1 + inflation)
+                
+                # 執行提領
+                actual_withdrawal_this_month = current_annual_withdrawal
+                current_balance -= actual_withdrawal_this_month
+                cumulative_withdrawal += actual_withdrawal_this_month
+            
+            # 檢查破產
             if current_balance <= 0:
                 current_balance = 0
-                failed = True
-                failure_year = year - start_year + 1
-                cumulative_withdrawal += this_year_withdrawal
-                records.append({'年份': year, '期末餘額': 0, '當年度提領': this_year_withdrawal, '累計提領': cumulative_withdrawal})
-                history.append(0)
-                break
+                if not failed:
+                    failed = True
+                    failure_year = year - start_date.year + 1
             
-            cumulative_withdrawal += this_year_withdrawal
-            ret = (row.get(self.stock_symbol, 0) * stock_pct +
-                   row.get(self.bond_symbol, 0) * bond_pct +
-                   row.get(self.cash_symbol, 0) * cash_pct)
-            current_balance *= (1 + ret)
+            # --- 2. 投資增長 (月報酬) ---
+            if current_balance > 0:
+                ret = (row.get(self.stock_symbol, 0) * stock_pct +
+                       row.get(self.bond_symbol, 0) * bond_pct +
+                       row.get(self.cash_symbol, 0) * cash_pct)
+                current_balance *= (1 + ret)
+            
             history.append(current_balance)
             
-            records.append({'年份': year, '期末餘額': current_balance, '當年度提領': this_year_withdrawal, '累計提領': cumulative_withdrawal})
+            # --- 3. 更新年度紀錄 ---
+            # 這裡的邏輯是持續更新該年份的數據，最後留下來的就是年底數據
+            yearly_records[year] = {
+                '年份': year,
+                '期末餘額': current_balance,
+                '當年度提領': current_annual_withdrawal, 
+                '累計提領': cumulative_withdrawal
+            }
 
-            if use_fixed_inflation:
-                inflation = fixed_inflation_rate
-            else:
-                inflation = 0.03
-                if self.cpi_annual is not None:
-                    try:
-                        if year in self.cpi_annual.index.year:
-                            val = self.cpi_annual.loc[self.cpi_annual.index.year == year, 'inflation_rate'].values[0]
-                            inflation = val
-                    except: pass
-            current_withdrawal *= (1 + inflation)
-
-        last_recorded_year = records[-1]['年份'] if records else start_year - 1
-        while len(history) < years_retired + 1:
-            history.append(0)
-            last_recorded_year += 1
-            records.append({'年份': last_recorded_year, '期末餘額': 0, '當年度提領': 0, '累計提領': cumulative_withdrawal})
-
-        detailed_df = pd.DataFrame(records)
+        # 整理輸出
+        detailed_df = pd.DataFrame(list(yearly_records.values()))
+        
+        # 計算 MDD (基於月度數據，更精確)
         history_np = np.array(history)
         running_max = np.maximum.accumulate(history_np)
         running_max[running_max == 0] = 1
         drawdowns = (running_max - history_np) / running_max
         mdd = drawdowns.max()
         mdd_idx = drawdowns.argmax()
-        mdd_year = start_year + mdd_idx - 1 
-        if mdd_year < start_year: mdd_year = start_year 
+        
+        # 推算 MDD 發生的概略年份 (根據月數推算)
+        mdd_year = start_date.year + (mdd_idx // 12)
         
         final_balance_val = history[-1]
-        cagr = (final_balance_val / initial_portfolio) ** (1/years_retired) - 1 if final_balance_val > 0 else -1.0
+        years_duration = len(monthly_returns) / 12
+        if years_duration < 1: years_duration = 1
+        
+        cagr = (final_balance_val / initial_portfolio) ** (1/years_duration) - 1 if final_balance_val > 0 else -1.0
 
         return {
             'success': not failed,
@@ -236,7 +252,7 @@ class RetirementSimulator:
             'mdd_year': mdd_year,
             'history': history,
             'detailed_df': detailed_df,
-            'years': years_retired
+            'years': years_duration
         }
 
 def to_excel(results_dict, annual_returns_df):
@@ -267,12 +283,12 @@ if "user_email" not in st.session_state:
 
 # --- 畫面 A: 尚未登入 ---
 if not st.session_state["user_email"]:
-    st.title("🔒退休提領回測工具")
-    st.markdown("請登入以使用完整功能")
-    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用Google帳號登入以開始使用")
+    st.title("🔒 退休提領回測工具")
+    st.markdown("### 請登入以使用完整功能")
+    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
     
     try:
-        # 設定 OAuth 元件 (修正：初始化時不放入 scope)
+        # 設定 OAuth 元件
         oauth2 = OAuth2Component(
             st.secrets["GOOGLE_CLIENT_ID"], 
             st.secrets["GOOGLE_CLIENT_SECRET"],
@@ -280,7 +296,7 @@ if not st.session_state["user_email"]:
             "https://oauth2.googleapis.com/token"
         )
         
-        # 顯示登入按鈕 (修正：scope 參數移至此處)
+        # 顯示登入按鈕
         result = oauth2.authorize_button(
             name="使用 Google 帳號登入",
             icon="https://www.google.com.tw/favicon.ico",
@@ -335,7 +351,7 @@ else:
             st.caption("將使用 FRED (CPIAUCSL) 歷史數據")
 
     with st.sidebar.expander("3. 投資標的代碼", expanded=False):
-        st.caption("輸入YAHOO FINANCE股票代碼，'CASH0'可模擬零息現金")
+        st.caption("輸入 'CASH0' 可模擬零息現金")
         sym_stock = st.text_input("股票代碼", "VFINX")
         sym_bond = st.text_input("債券代碼", "VUSTX")
         sym_cash = st.text_input("現金代碼", "VFISX")
@@ -356,8 +372,8 @@ else:
     p2 = portfolio_input(2, 50, 50, 0)
     p3 = portfolio_input(3, 50, 0, 50)
 
-    st.title("📈金蛋模擬器")
-    st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金流模擬器，僅供教育用途")
+    st.title("📈 退休提領回測工具 (Web版)")
+    st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
 
     # 載入數據函式 (放在這裡確保只在登入後執行)
     @st.cache_data(ttl=3600)
@@ -404,10 +420,11 @@ else:
                         colors = ['#3498db', '#2ecc71', '#e74c3c']
                         for i, (name, res) in enumerate(results.items()):
                             history = np.array(res['history'])
-                            years = range(len(history))
+                            # 月度圖表：x 軸改為月
+                            months_axis = np.arange(len(history)) / 12
                             color = colors[i % len(colors)]
-                            ax.plot(years, history/1000000, label=name, linewidth=2.5, color=color)
-                            ax.scatter(years[-1], history[-1]/1000000, s=50, color=color)
+                            ax.plot(months_axis, history/1000000, label=name, linewidth=2.5, color=color)
+                            ax.scatter(months_axis[-1], history[-1]/1000000, s=50, color=color)
                         ax.set_title(f"資產淨值走勢 ({total_years}年期間)", fontsize=14)
                         ax.set_xlabel("經過年數")
                         ax.set_ylabel("資產餘額 (百萬)")
@@ -429,7 +446,7 @@ else:
                             c1.metric("模擬結果", "成功" if is_success else f"第 {res['failure_year']} 年破產", delta_color="normal" if is_success else "inverse")
                             c2.metric("期末資產", f"${final_bal:,.0f}")
                             c3.metric("CAGR (年化)", f"{cagr:.2%}")
-                            c4.metric("最大回撤 (MDD)", f"{mdd:.1%}", help=f"發生於第 {res['mdd_year']} 年")
+                            c4.metric("最大回撤 (MDD)", f"{mdd:.1%}", help=f"發生於第 {res['mdd_year']} 年左右")
                             st.divider()
 
                 with tab3:
@@ -442,22 +459,30 @@ else:
                     st.dataframe(fmt_df, use_container_width=True)
 
                 with tab4:
-                    st.markdown("### 年度詳細收支表")
-                    for name, res in results.items():
-                        with st.expander(f"{name} - 詳細數據", expanded=False):
-                            df_detail = res['detailed_df']
-                            df_show = df_detail.set_index('年份')
-                            st.dataframe(df_show.style.format({'期末餘額': '${:,.0f}', '當年度提領': '${:,.0f}', '累計提領': '${:,.0f}'}), use_container_width=True)
+                    # 這裡加入會員權限控管
+                    if st.session_state["user_email"]:
+                        st.markdown("### 年度詳細收支表")
+                        for name, res in results.items():
+                            with st.expander(f"{name} - 詳細數據", expanded=False):
+                                df_detail = res['detailed_df']
+                                df_show = df_detail.set_index('年份')
+                                st.dataframe(df_show.style.format({'期末餘額': '${:,.0f}', '當年度提領': '${:,.0f}', '累計提領': '${:,.0f}'}), use_container_width=True)
+                    else:
+                        st.warning("🔒 此功能僅限會員使用，請在左側 Google 登入。")
+                        st.info("登入後即可解鎖「詳細收支表」與「Excel 報告下載」功能！")
 
-                # 下載按鈕 (現在人人可見，因為已經登入才能進來)
+                # --- 下載按鈕 (權限控管) ---
                 st.divider()
                 if results:
-                    excel_data = to_excel(results, annual_df)
-                    st.download_button(
-                        label="📥 下載完整 Excel 報告",
-                        data=excel_data,
-                        file_name='retirement_simulation_report.xlsx',
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                    )
+                    if st.session_state["user_email"]:
+                        excel_data = to_excel(results, annual_df)
+                        st.download_button(
+                            label="📥 下載完整 Excel 報告",
+                            data=excel_data,
+                            file_name='retirement_simulation_report.xlsx',
+                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                        )
+                    else:
+                        st.button("🔒 登入後下載完整 Excel 報告", disabled=True)
     else:
         st.info("👈 請在左側調整參數，並點擊「開始回測」按鈕")
