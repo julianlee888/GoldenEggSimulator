@@ -12,13 +12,7 @@ import json
 import base64
 import time
 from matplotlib import font_manager as fm
-# 嘗試匯入 OAuth，若失敗則提示
-try:
-    from streamlit_oauth import OAuth2Component
-except ImportError:
-    st.error("請在 requirements.txt 中加入 streamlit-oauth")
-    st.stop()
-
+from streamlit_oauth import OAuth2Component
 import extra_streamlit_components as stx
 
 # --- 1. 頁面基本設定 ---
@@ -28,12 +22,10 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Cookie 管理器 (放在最前面以確保載入) ---
-try:
-    cookie_manager = stx.CookieManager()
-except Exception as e:
-    st.warning("Cookie 管理器載入失敗，將無法保持登入狀態。")
-    cookie_manager = None
+# --- Cookie 管理器設定 (保持登入關鍵) ---
+# 修正: Streamlit 新版本禁止在快取函式中建立元件，移除 @st.cache_resource
+# 直接初始化即可，套件內部會處理狀態
+cookie_manager = stx.CookieManager()
 
 # --- 2. 工具函式：字型 ---
 @st.cache_resource
@@ -63,11 +55,6 @@ plt.style.use('ggplot')
 def save_lead_to_firebase(email):
     """將使用者的 Email 寫入 Firestore"""
     try:
-        # 檢查 Secrets 是否存在
-        if "FIREBASE_WEB_API_KEY" not in st.secrets or "FIREBASE_PROJECT_ID" not in st.secrets:
-            print("Firebase secrets missing")
-            return
-
         api_key = st.secrets["FIREBASE_WEB_API_KEY"]
         project_id = st.secrets["FIREBASE_PROJECT_ID"]
         doc_id = base64.b64encode(email.encode()).decode()
@@ -86,9 +73,11 @@ def save_lead_to_firebase(email):
 # --- 4. 核心邏輯類別 (模擬器) ---
 class RetirementSimulator:
     def __init__(self, stock_symbol, bond_symbol, cash_symbol, start_date, end_date):
+        # 自動轉大寫並去除空白，解決 0050.tw 找不到的問題
         self.stock_symbol = stock_symbol.upper().strip()
         self.bond_symbol = bond_symbol.upper().strip()
         self.cash_symbol = cash_symbol.upper().strip()
+        
         self.request_start_date = pd.to_datetime(start_date)
         self.request_end_date = pd.to_datetime(end_date) if end_date else pd.Timestamp.now()
         self.actual_start_date = None
@@ -100,23 +89,32 @@ class RetirementSimulator:
 
     def download_data(self):
         tickers = [self.stock_symbol, self.bond_symbol, self.cash_symbol]
+        # 過濾掉 CASH0，只下載真實存在的標的
         real_tickers = [t for t in tickers if t != 'CASH0']
         
         if real_tickers:
             try:
+                # 下載數據
                 data = yf.download(real_tickers, start=self.request_start_date, end=self.request_end_date, progress=False, auto_adjust=False)
+                
+                # 處理資料結構：單一股票 vs 多檔股票
+                # 多檔股票會回傳 MultiIndex DataFrame，單檔股票可能回傳一般 DataFrame
                 if 'Adj Close' in data:
                     df = data['Adj Close'].copy()
                 else:
-                    df = data.copy()
+                    df = data.copy() # Fallback
 
+                # 關鍵修正：如果只下載一檔股票，yfinance 有時回傳的是 Series 或沒有 column name 的 DataFrame
+                # 我們強制將其轉換為以 ticker 為 column name 的 DataFrame
                 if len(real_tickers) == 1:
                     ticker = real_tickers[0]
                     if isinstance(df, pd.Series):
                         df = df.to_frame(name=ticker)
                     elif isinstance(df, pd.DataFrame):
+                        # 如果是單欄 DataFrame 但欄位名不是 ticker (例如 'Adj Close')
                         if ticker not in df.columns:
                             df.columns = [ticker]
+            
             except Exception as e:
                 self.error_msg = f"下載數據失敗: {e}"
                 return
@@ -125,26 +123,36 @@ class RetirementSimulator:
                 self.error_msg = "無法取得數據，請檢查日期範圍或代碼。"
                 return
 
+            # 檢查缺失代碼 (比對時確保都用大寫)
             downloaded_cols = [str(c).upper() for c in df.columns]
-            missing = []
-            for t in real_tickers:
-                if not any(t in col for col in downloaded_cols):
-                    missing.append(t)
+            missing = [t for t in real_tickers if t not in downloaded_cols]
             
+            # 有時候 yfinance 即使下載失敗也不會報錯，只會少欄位
             if missing:
-                self.error_msg = f"找不到以下標的: {missing} (請確認代碼正確)"
-                return
+                # 再次嘗試寬容檢查 (有些代碼可能有後綴差異)
+                really_missing = []
+                for t in missing:
+                    # 如果找不到完全匹配，看看是否有包含關係
+                    if not any(t in col for col in downloaded_cols):
+                        really_missing.append(t)
+                
+                if really_missing:
+                    self.error_msg = f"找不到以下標的: {really_missing} (請確認 Yahoo Finance 代碼正確，台股請加 .TW)"
+                    return
         else:
             try:
+                # 如果全是 CASH0，用 SPY 抓時間軸
                 temp = yf.download("SPY", start=self.request_start_date, end=self.request_end_date, progress=False)
                 df = pd.DataFrame(index=temp.index)
             except:
                 self.error_msg = "無法建立時間軸"
                 return
 
+        # 處理 CASH0
         if 'CASH0' in tickers:
             df['CASH0'] = 100.0
 
+        # 轉換月報酬
         df_monthly = df.resample('ME').last()
         self.returns = df_monthly.pct_change().dropna()
         self.prices = df_monthly.dropna()
@@ -226,6 +234,7 @@ class RetirementSimulator:
                     failure_year = year - start_date.year + 1
             
             if current_balance > 0:
+                # 使用 get(key, 0) 避免如果某個代碼下載失敗導致報錯，預設報酬為 0
                 ret = (row.get(self.stock_symbol, 0) * stock_pct +
                        row.get(self.bond_symbol, 0) * bond_pct +
                        row.get(self.cash_symbol, 0) * cash_pct)
@@ -253,6 +262,7 @@ class RetirementSimulator:
         final_balance_val = history[-1]
         years_duration = len(monthly_returns) / 12
         if years_duration < 1: years_duration = 1
+        
         cagr = (final_balance_val / initial_portfolio) ** (1/years_duration) - 1 if final_balance_val > 0 else -1.0
 
         return {
@@ -290,84 +300,64 @@ def to_excel(results_dict, annual_returns_df):
 
 # --- 5. 主程式介面邏輯 (登入牆) ---
 
+# 初始化 Session State
 if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
 
 # --- 自動登入邏輯：檢查 Cookie ---
-if cookie_manager:
-    try:
-        cookie_email = cookie_manager.get(cookie="user_email")
-        # 簡單驗證 cookie 是否為字串，避免錯誤
-        if cookie_email and isinstance(cookie_email, str) and st.session_state["user_email"] is None:
-            st.session_state["user_email"] = cookie_email
-    except:
-        pass 
-
-# --- 檢查 Secrets 設定 ---
-missing_secrets = []
-for key in ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI", "FIREBASE_WEB_API_KEY", "FIREBASE_PROJECT_ID"]:
-    if key not in st.secrets:
-        missing_secrets.append(key)
+try:
+    cookie_email = cookie_manager.get(cookie="user_email")
+    if cookie_email and st.session_state["user_email"] is None:
+        st.session_state["user_email"] = cookie_email
+except:
+    pass # 忽略初始化期間的錯誤
 
 # --- 畫面 A: 尚未登入 ---
 if not st.session_state["user_email"]:
     st.title("🔒 退休提領回測工具")
     st.markdown("### 請登入以使用完整功能")
+    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
     
-    if missing_secrets:
-        st.error("⚠️ 系統設定錯誤：缺少必要的 Secrets 金鑰")
-        st.code(f"缺少的金鑰:\n{', '.join(missing_secrets)}")
-        st.info("請前往 Streamlit Cloud > App Settings > Secrets 填入對應的 API Key。")
-    else:
-        st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
+    try:
+        oauth2 = OAuth2Component(
+            st.secrets["GOOGLE_CLIENT_ID"], 
+            st.secrets["GOOGLE_CLIENT_SECRET"],
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "https://oauth2.googleapis.com/token"
+        )
         
-        try:
-            oauth2 = OAuth2Component(
-                st.secrets["GOOGLE_CLIENT_ID"], 
-                st.secrets["GOOGLE_CLIENT_SECRET"],
-                "https://accounts.google.com/o/oauth2/v2/auth",
-                "https://oauth2.googleapis.com/token"
-            )
+        result = oauth2.authorize_button(
+            name="使用 Google 帳號登入",
+            icon="https://www.google.com.tw/favicon.ico",
+            redirect_uri=st.secrets["GOOGLE_REDIRECT_URI"],
+            scope="openid email profile",
+            key="google_auth_btn"
+        )
+        
+        if result:
+            id_token = result["token"]["id_token"]
+            payload = id_token.split('.')[1]
+            payload += '=' * (-len(payload) % 4)
+            decoded = json.loads(base64.b64decode(payload).decode('utf-8'))
+            email = decoded.get("email")
             
-            result = oauth2.authorize_button(
-                name="使用 Google 帳號登入",
-                icon="https://www.google.com.tw/favicon.ico",
-                redirect_uri=st.secrets["GOOGLE_REDIRECT_URI"],
-                scope="openid email profile",
-                key="google_auth_btn"
-            )
-            
-            if result:
-                # 解析 Email
-                id_token = result.get("token", {}).get("id_token")
-                if id_token:
-                    payload = id_token.split('.')[1]
-                    payload += '=' * (-len(payload) % 4)
-                    decoded = json.loads(base64.b64decode(payload).decode('utf-8'))
-                    email = decoded.get("email")
-                    
-                    if email:
-                        st.session_state["user_email"] = email
-                        
-                        # --- 寫入 Cookie (有效期 30 天) ---
-                        if cookie_manager:
-                            expires = datetime.datetime.now() + datetime.timedelta(days=30)
-                            cookie_manager.set("user_email", email, expires_at=expires)
-                        
-                        # 寫入資料庫
-                        save_lead_to_firebase(email)
-                        
-                        st.success(f"登入成功！歡迎 {email}")
-                        time.sleep(1)
-                        st.rerun()
-                else:
-                    st.error("登入失敗：無法取得 Token")
-                    
-        except Exception as e:
-            st.error(f"登入元件發生錯誤: {e}")
-            st.markdown("---")
-            st.markdown("**除錯資訊：**")
-            st.write(f"Redirect URI: `{st.secrets['GOOGLE_REDIRECT_URI']}`")
+            if email:
+                st.session_state["user_email"] = email
+                
+                # --- 寫入 Cookie (有效期 30 天) ---
+                expires = datetime.datetime.now() + datetime.timedelta(days=30)
+                cookie_manager.set("user_email", email, expires_at=expires)
+                
+                # 寫入資料庫
+                save_lead_to_firebase(email)
+                
+                st.success(f"登入成功！歡迎 {email}")
+                time.sleep(1)
+                st.rerun()
+                
+    except Exception as e:
+        st.error(f"登入設定錯誤: {e}")
+        st.info("請檢查 Secrets 設定是否正確")
 
 # --- 畫面 B: 已登入 (顯示計算機) ---
 else:
@@ -375,8 +365,8 @@ else:
         st.write(f"👤 **{st.session_state['user_email']}**")
         if st.button("登出"):
             st.session_state["user_email"] = None
-            if cookie_manager:
-                cookie_manager.delete("user_email")
+            # --- 刪除 Cookie ---
+            cookie_manager.delete("user_email")
             st.rerun()
         st.divider()
 
