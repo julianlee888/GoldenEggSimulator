@@ -17,18 +17,15 @@ import extra_streamlit_components as stx
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="金蛋模擬器",
+    page_title="退休提領回測工具",
     page_icon="💰",
     layout="wide"
 )
 
 # --- Cookie 管理器設定 (保持登入關鍵) ---
-# 修正: 移除不支援的 experimental_allow_widgets 參數
-@st.cache_resource
-def get_manager():
-    return stx.CookieManager()
-
-cookie_manager = get_manager()
+# 修正: Streamlit 新版本禁止在快取函式中建立元件，移除 @st.cache_resource
+# 直接初始化即可，套件內部會處理狀態
+cookie_manager = stx.CookieManager()
 
 # --- 2. 工具函式：字型 ---
 @st.cache_resource
@@ -308,8 +305,6 @@ if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
 
 # --- 自動登入邏輯：檢查 Cookie ---
-# 注意：cookie_manager.get 需要一點時間，可能在第一次渲染時回傳 None
-# 我們使用一個簡單的檢查，如果沒有 user_email 但有 cookie，就寫入
 try:
     cookie_email = cookie_manager.get(cookie="user_email")
     if cookie_email and st.session_state["user_email"] is None:
@@ -411,8 +406,8 @@ else:
     p2 = portfolio_input(2, 50, 50, 0)
     p3 = portfolio_input(3, 50, 0, 50)
 
-    st.title("📈金蛋模擬器")
-    st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金流模擬器，僅供教育使用")
+    st.title("📈 退休提領回測工具 (Web版)")
+    st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
 
     @st.cache_data(ttl=3600)
     def load_market_data(s, b, c, start, end):
