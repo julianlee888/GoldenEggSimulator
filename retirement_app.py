@@ -17,13 +17,14 @@ import extra_streamlit_components as stx
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="退休提領回測工具",
+    page_title="金蛋模擬器",
     page_icon="💰",
     layout="wide"
 )
 
 # --- Cookie 管理器設定 (保持登入關鍵) ---
-@st.cache_resource(experimental_allow_widgets=True)
+# 修正: 移除不支援的 experimental_allow_widgets 參數
+@st.cache_resource
 def get_manager():
     return stx.CookieManager()
 
@@ -307,12 +308,14 @@ if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
 
 # --- 自動登入邏輯：檢查 Cookie ---
-if st.session_state["user_email"] is None:
-    # 嘗試從 Cookie 讀取 (Cookie 名稱: user_email)
+# 注意：cookie_manager.get 需要一點時間，可能在第一次渲染時回傳 None
+# 我們使用一個簡單的檢查，如果沒有 user_email 但有 cookie，就寫入
+try:
     cookie_email = cookie_manager.get(cookie="user_email")
-    if cookie_email:
+    if cookie_email and st.session_state["user_email"] is None:
         st.session_state["user_email"] = cookie_email
-        # 不需要 rerun，直接進入下方的已登入畫面即可，Streamlit 會自動刷新狀態
+except:
+    pass # 忽略初始化期間的錯誤
 
 # --- 畫面 A: 尚未登入 ---
 if not st.session_state["user_email"]:
@@ -347,7 +350,6 @@ if not st.session_state["user_email"]:
                 st.session_state["user_email"] = email
                 
                 # --- 寫入 Cookie (有效期 30 天) ---
-                # 注意：key 要與上面讀取時一致
                 expires = datetime.datetime.now() + datetime.timedelta(days=30)
                 cookie_manager.set("user_email", email, expires_at=expires)
                 
@@ -409,8 +411,8 @@ else:
     p2 = portfolio_input(2, 50, 50, 0)
     p3 = portfolio_input(3, 50, 0, 50)
 
-    st.title("📈 退休提領回測工具 (Web版)")
-    st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
+    st.title("📈金蛋模擬器")
+    st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金流模擬器，僅供教育使用")
 
     @st.cache_data(ttl=3600)
     def load_market_data(s, b, c, start, end):
