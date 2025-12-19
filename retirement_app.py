@@ -13,6 +13,7 @@ import base64
 import time
 from matplotlib import font_manager as fm
 from streamlit_oauth import OAuth2Component
+import extra_streamlit_components as stx
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
@@ -20,6 +21,13 @@ st.set_page_config(
     page_icon="💰",
     layout="wide"
 )
+
+# --- Cookie 管理器設定 (保持登入關鍵) ---
+@st.cache_resource(experimental_allow_widgets=True)
+def get_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_manager()
 
 # --- 2. 工具函式：字型 ---
 @st.cache_resource
@@ -294,8 +302,17 @@ def to_excel(results_dict, annual_returns_df):
 
 # --- 5. 主程式介面邏輯 (登入牆) ---
 
+# 初始化 Session State
 if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
+
+# --- 自動登入邏輯：檢查 Cookie ---
+if st.session_state["user_email"] is None:
+    # 嘗試從 Cookie 讀取 (Cookie 名稱: user_email)
+    cookie_email = cookie_manager.get(cookie="user_email")
+    if cookie_email:
+        st.session_state["user_email"] = cookie_email
+        # 不需要 rerun，直接進入下方的已登入畫面即可，Streamlit 會自動刷新狀態
 
 # --- 畫面 A: 尚未登入 ---
 if not st.session_state["user_email"]:
@@ -328,7 +345,15 @@ if not st.session_state["user_email"]:
             
             if email:
                 st.session_state["user_email"] = email
+                
+                # --- 寫入 Cookie (有效期 30 天) ---
+                # 注意：key 要與上面讀取時一致
+                expires = datetime.datetime.now() + datetime.timedelta(days=30)
+                cookie_manager.set("user_email", email, expires_at=expires)
+                
+                # 寫入資料庫
                 save_lead_to_firebase(email)
+                
                 st.success(f"登入成功！歡迎 {email}")
                 time.sleep(1)
                 st.rerun()
@@ -343,6 +368,8 @@ else:
         st.write(f"👤 **{st.session_state['user_email']}**")
         if st.button("登出"):
             st.session_state["user_email"] = None
+            # --- 刪除 Cookie ---
+            cookie_manager.delete("user_email")
             st.rerun()
         st.divider()
 
