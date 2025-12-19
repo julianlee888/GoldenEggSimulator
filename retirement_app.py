@@ -67,9 +67,11 @@ def save_lead_to_firebase(email):
 # --- 4. 核心邏輯類別 (模擬器) ---
 class RetirementSimulator:
     def __init__(self, stock_symbol, bond_symbol, cash_symbol, start_date, end_date):
-        self.stock_symbol = stock_symbol
-        self.bond_symbol = bond_symbol
-        self.cash_symbol = cash_symbol
+        # 自動轉大寫並去除空白，解決 0050.tw 找不到的問題
+        self.stock_symbol = stock_symbol.upper().strip()
+        self.bond_symbol = bond_symbol.upper().strip()
+        self.cash_symbol = cash_symbol.upper().strip()
+        
         self.request_start_date = pd.to_datetime(start_date)
         self.request_end_date = pd.to_datetime(end_date) if end_date else pd.Timestamp.now()
         self.actual_start_date = None
@@ -81,15 +83,32 @@ class RetirementSimulator:
 
     def download_data(self):
         tickers = [self.stock_symbol, self.bond_symbol, self.cash_symbol]
+        # 過濾掉 CASH0，只下載真實存在的標的
         real_tickers = [t for t in tickers if t != 'CASH0']
         
         if real_tickers:
             try:
+                # 下載數據
                 data = yf.download(real_tickers, start=self.request_start_date, end=self.request_end_date, progress=False, auto_adjust=False)
+                
+                # 處理資料結構：單一股票 vs 多檔股票
+                # 多檔股票會回傳 MultiIndex DataFrame，單檔股票可能回傳一般 DataFrame
                 if 'Adj Close' in data:
                     df = data['Adj Close'].copy()
                 else:
-                    df = data.copy()
+                    df = data.copy() # Fallback
+
+                # 關鍵修正：如果只下載一檔股票，yfinance 有時回傳的是 Series 或沒有 column name 的 DataFrame
+                # 我們強制將其轉換為以 ticker 為 column name 的 DataFrame
+                if len(real_tickers) == 1:
+                    ticker = real_tickers[0]
+                    if isinstance(df, pd.Series):
+                        df = df.to_frame(name=ticker)
+                    elif isinstance(df, pd.DataFrame):
+                        # 如果是單欄 DataFrame 但欄位名不是 ticker (例如 'Adj Close')
+                        if ticker not in df.columns:
+                            df.columns = [ticker]
+            
             except Exception as e:
                 self.error_msg = f"下載數據失敗: {e}"
                 return
@@ -98,22 +117,36 @@ class RetirementSimulator:
                 self.error_msg = "無法取得數據，請檢查日期範圍或代碼。"
                 return
 
-            downloaded_cols = df.columns.tolist() if isinstance(df.columns, pd.Index) else []
+            # 檢查缺失代碼 (比對時確保都用大寫)
+            downloaded_cols = [str(c).upper() for c in df.columns]
             missing = [t for t in real_tickers if t not in downloaded_cols]
+            
+            # 有時候 yfinance 即使下載失敗也不會報錯，只會少欄位
             if missing:
-                self.error_msg = f"找不到以下標的: {missing}"
-                return
+                # 再次嘗試寬容檢查 (有些代碼可能有後綴差異)
+                really_missing = []
+                for t in missing:
+                    # 如果找不到完全匹配，看看是否有包含關係
+                    if not any(t in col for col in downloaded_cols):
+                        really_missing.append(t)
+                
+                if really_missing:
+                    self.error_msg = f"找不到以下標的: {really_missing} (請確認 Yahoo Finance 代碼正確，台股請加 .TW)"
+                    return
         else:
             try:
+                # 如果全是 CASH0，用 SPY 抓時間軸
                 temp = yf.download("SPY", start=self.request_start_date, end=self.request_end_date, progress=False)
                 df = pd.DataFrame(index=temp.index)
             except:
                 self.error_msg = "無法建立時間軸"
                 return
 
+        # 處理 CASH0
         if 'CASH0' in tickers:
             df['CASH0'] = 100.0
 
+        # 轉換月報酬
         df_monthly = df.resample('ME').last()
         self.returns = df_monthly.pct_change().dropna()
         self.prices = df_monthly.dropna()
@@ -151,7 +184,6 @@ class RetirementSimulator:
             bond_pct /= total
             cash_pct /= total
 
-        # 改用月度數據進行模擬，以提升 MDD 精確度
         monthly_returns = self.returns
         if monthly_returns.empty: return {}
 
@@ -162,23 +194,16 @@ class RetirementSimulator:
         cumulative_withdrawal = 0.0
         failed = False
         failure_year = None
-        history = [initial_portfolio] # 月度資產紀錄
-        
-        # 用於生成年度報表
+        history = [initial_portfolio]
         yearly_records = {} 
-        
-        # 設定提領月份 (周年制)
         withdrawal_month = start_date.month
 
         for date, row in monthly_returns.iterrows():
             year = date.year
             month = date.month
             
-            # --- 1. 處理提領 (每年一次) ---
             actual_withdrawal_this_month = 0
-            
             if month == withdrawal_month:
-                # 通膨調整 (第一年除外)
                 if date != start_date:
                     if use_fixed_inflation:
                         inflation = fixed_inflation_rate
@@ -186,27 +211,24 @@ class RetirementSimulator:
                         inflation = 0.03
                         if self.cpi_annual is not None:
                             try:
-                                # 抓取前一年的通膨數據
                                 target_year = year - 1
                                 if target_year in self.cpi_annual.index.year:
                                     inflation = self.cpi_annual.loc[self.cpi_annual.index.year == target_year, 'inflation_rate'].values[0]
                             except: pass
                     current_annual_withdrawal *= (1 + inflation)
                 
-                # 執行提領
                 actual_withdrawal_this_month = current_annual_withdrawal
                 current_balance -= actual_withdrawal_this_month
                 cumulative_withdrawal += actual_withdrawal_this_month
             
-            # 檢查破產
             if current_balance <= 0:
                 current_balance = 0
                 if not failed:
                     failed = True
                     failure_year = year - start_date.year + 1
             
-            # --- 2. 投資增長 (月報酬) ---
             if current_balance > 0:
+                # 使用 get(key, 0) 避免如果某個代碼下載失敗導致報錯，預設報酬為 0
                 ret = (row.get(self.stock_symbol, 0) * stock_pct +
                        row.get(self.bond_symbol, 0) * bond_pct +
                        row.get(self.cash_symbol, 0) * cash_pct)
@@ -214,8 +236,6 @@ class RetirementSimulator:
             
             history.append(current_balance)
             
-            # --- 3. 更新年度紀錄 ---
-            # 這裡的邏輯是持續更新該年份的數據，最後留下來的就是年底數據
             yearly_records[year] = {
                 '年份': year,
                 '期末餘額': current_balance,
@@ -223,18 +243,14 @@ class RetirementSimulator:
                 '累計提領': cumulative_withdrawal
             }
 
-        # 整理輸出
         detailed_df = pd.DataFrame(list(yearly_records.values()))
         
-        # 計算 MDD (基於月度數據，更精確)
         history_np = np.array(history)
         running_max = np.maximum.accumulate(history_np)
         running_max[running_max == 0] = 1
         drawdowns = (running_max - history_np) / running_max
         mdd = drawdowns.max()
         mdd_idx = drawdowns.argmax()
-        
-        # 推算 MDD 發生的概略年份 (根據月數推算)
         mdd_year = start_date.year + (mdd_idx // 12)
         
         final_balance_val = history[-1]
@@ -288,7 +304,6 @@ if not st.session_state["user_email"]:
     st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
     
     try:
-        # 設定 OAuth 元件
         oauth2 = OAuth2Component(
             st.secrets["GOOGLE_CLIENT_ID"], 
             st.secrets["GOOGLE_CLIENT_SECRET"],
@@ -296,7 +311,6 @@ if not st.session_state["user_email"]:
             "https://oauth2.googleapis.com/token"
         )
         
-        # 顯示登入按鈕
         result = oauth2.authorize_button(
             name="使用 Google 帳號登入",
             icon="https://www.google.com.tw/favicon.ico",
@@ -306,7 +320,6 @@ if not st.session_state["user_email"]:
         )
         
         if result:
-            # 解析 Email
             id_token = result["token"]["id_token"]
             payload = id_token.split('.')[1]
             payload += '=' * (-len(payload) % 4)
@@ -315,7 +328,6 @@ if not st.session_state["user_email"]:
             
             if email:
                 st.session_state["user_email"] = email
-                # 寫入資料庫
                 save_lead_to_firebase(email)
                 st.success(f"登入成功！歡迎 {email}")
                 time.sleep(1)
@@ -327,7 +339,6 @@ if not st.session_state["user_email"]:
 
 # --- 畫面 B: 已登入 (顯示計算機) ---
 else:
-    # 側邊欄：使用者資訊
     with st.sidebar:
         st.write(f"👤 **{st.session_state['user_email']}**")
         if st.button("登出"):
@@ -335,7 +346,6 @@ else:
             st.rerun()
         st.divider()
 
-    # 側邊欄：參數設定
     st.sidebar.header("⚙️ 參數設定")
     with st.sidebar.expander("1. 資金與期間", expanded=True):
         start_capital = st.number_input("初始本金", value=10000000, step=100000)
@@ -375,7 +385,6 @@ else:
     st.title("📈 退休提領回測工具 (Web版)")
     st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
 
-    # 載入數據函式 (放在這裡確保只在登入後執行)
     @st.cache_data(ttl=3600)
     def load_market_data(s, b, c, start, end):
         sim = RetirementSimulator(s, b, c, start, end)
@@ -420,7 +429,6 @@ else:
                         colors = ['#3498db', '#2ecc71', '#e74c3c']
                         for i, (name, res) in enumerate(results.items()):
                             history = np.array(res['history'])
-                            # 月度圖表：x 軸改為月
                             months_axis = np.arange(len(history)) / 12
                             color = colors[i % len(colors)]
                             ax.plot(months_axis, history/1000000, label=name, linewidth=2.5, color=color)
@@ -459,7 +467,6 @@ else:
                     st.dataframe(fmt_df, use_container_width=True)
 
                 with tab4:
-                    # 這裡加入會員權限控管
                     if st.session_state["user_email"]:
                         st.markdown("### 年度詳細收支表")
                         for name, res in results.items():
@@ -471,7 +478,6 @@ else:
                         st.warning("🔒 此功能僅限會員使用，請在左側 Google 登入。")
                         st.info("登入後即可解鎖「詳細收支表」與「Excel 報告下載」功能！")
 
-                # --- 下載按鈕 (權限控管) ---
                 st.divider()
                 if results:
                     if st.session_state["user_email"]:
