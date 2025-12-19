@@ -16,7 +16,7 @@ from streamlit_oauth import OAuth2Component
 
 # --- 1. 頁面基本設定 ---
 st.set_page_config(
-    page_title="退休提領回測工具",
+    page_title="金蛋模擬器",
     page_icon="💰",
     layout="wide"
 )
@@ -267,9 +267,9 @@ if "user_email" not in st.session_state:
 
 # --- 畫面 A: 尚未登入 ---
 if not st.session_state["user_email"]:
-    st.title("🔒 退休提領回測工具")
-    st.markdown("### 請登入以使用完整功能")
-    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
+    st.title("🔒退休提領回測工具")
+    st.markdown("請登入以使用完整功能")
+    st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用Google帳號登入以開始使用")
     
     try:
         # 設定 OAuth 元件 (修正：初始化時不放入 scope)
@@ -335,7 +335,7 @@ else:
             st.caption("將使用 FRED (CPIAUCSL) 歷史數據")
 
     with st.sidebar.expander("3. 投資標的代碼", expanded=False):
-        st.caption("輸入 'CASH0' 可模擬零息現金")
+        st.caption("輸入YAHOO FINANCE股票代碼，'CASH0'可模擬零息現金")
         sym_stock = st.text_input("股票代碼", "VFINX")
         sym_bond = st.text_input("債券代碼", "VUSTX")
         sym_cash = st.text_input("現金代碼", "VFISX")
@@ -356,8 +356,8 @@ else:
     p2 = portfolio_input(2, 50, 50, 0)
     p3 = portfolio_input(3, 50, 0, 50)
 
-    st.title("📈 退休提領回測工具 (Web版)")
-    st.markdown("基於 Bengen 4% 法則與 Trinity Study 邏輯的互動式模擬器。")
+    st.title("📈金蛋模擬器")
+    st.markdown("以Bengen 4%法則與Trinity Study為基礎的退休金流模擬器，僅供教育用途")
 
     # 載入數據函式 (放在這裡確保只在登入後執行)
     @st.cache_data(ttl=3600)
