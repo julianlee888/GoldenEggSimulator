@@ -6,3 +6,4 @@ matplotlib
 xlsxwriter
 requests
 streamlit-oauth
+extra-streamlit-components
