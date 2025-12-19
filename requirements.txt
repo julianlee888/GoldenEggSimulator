@@ -6,3 +6,4 @@ matplotlib
 lxml
 requests
 firebase-admin
+OAuth
