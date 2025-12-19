@@ -272,21 +272,20 @@ if not st.session_state["user_email"]:
     st.markdown("本工具提供強大的歷史回測功能，協助您規劃退休金流。請使用 Google 帳號登入以開始使用。")
     
     try:
-        # 設定 OAuth 元件
+        # 設定 OAuth 元件 (修正：初始化時不放入 scope)
         oauth2 = OAuth2Component(
             st.secrets["GOOGLE_CLIENT_ID"], 
             st.secrets["GOOGLE_CLIENT_SECRET"],
             "https://accounts.google.com/o/oauth2/v2/auth",
-            "https://oauth2.googleapis.com/token",
-            "https://www.googleapis.com/auth/userinfo.email",
-            "openid email profile"
+            "https://oauth2.googleapis.com/token"
         )
         
-        # 顯示登入按鈕
+        # 顯示登入按鈕 (修正：scope 參數移至此處)
         result = oauth2.authorize_button(
             name="使用 Google 帳號登入",
             icon="https://www.google.com.tw/favicon.ico",
             redirect_uri=st.secrets["GOOGLE_REDIRECT_URI"],
+            scope="openid email profile",
             key="google_auth_btn"
         )
         
